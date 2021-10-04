@@ -1,0 +1,329 @@
+/* Programa: monitoramento remoto (via SigFox) de volume e vazão de um 
+ *           reservatório de água.
+ * Autor: Pedro Bertoleti
+ */
+#include <SoftwareSerial.h>
+#include <Ultrasonic.h>
+
+/* Definições - sensor ultrassonico */
+#define GPIO_TRIGGER              8
+#define GPIO_ECHO                 7
+#define NUM_MEDIDAS_DISTANCIA     50
+#define ESCREVE_DEBUG_SENSOR
+
+/* Definições - reservatório 
+   IMPORTANTE: é considerado aqui um eservatório cilindrico,
+               com área superficial circular.
+*/
+#define PI_APROXIMADO             3.1415927
+#define RESERVATORIO_RAIO         2.0 //m
+#define RESERVATORIO_ALTURA       10.0 //m
+
+/* Definição - breathing light */
+#define TEMPO_BREATHING_LIGHT     500 //ms
+
+/* Definições - comandos AT para o HT32SX */
+#define CMD_AT_HT32SX_RESET            "AT+RESET;"
+#define CMD_AT_HT32SX_RCZ2             "AT+CFGRCZ=2;"
+#define CMD_AT_HT32SX_MANDA_BYTES      "AT+SEND=0:" //sem downlink
+#define CMD_AT_HT32SX_ENTRA_DEEP_SLEEP "AT+DEEPSLEEP;"
+#define CMD_AT_HT32SX_SAI_DEEP_SLEEP   "AT+WKP;"
+
+/* Definições - tempo entre envios SigFox */
+#define TEMPO_ENTRE_ENVIOS_SIGFOX         3600000 /* 3600000ms = 1 hora */
+
+/* Definições - GPIOs usados na comunicação com HT32SX*/
+#define RESET  4   /* Reset no HT32SX */
+#define TX     2   /* Serial TX (Nano -> HT32SX) */
+#define RX     3   /* Serial RX (Nano <- HT32SX) */
+
+/* Definição - GPIO do LED */
+#define LED    13 
+
+/* Definições - baudrates das comunicações seriais */
+#define BAUDRATE_SERIAL_DEBUG     115200
+#define BAUDRATE_SERIAL_HT32SX    9600
+
+/* Objeto para controle da software serial
+   (para comunicação Nano <-> HT32SX */
+SoftwareSerial serial_HT32SX(RX, TX);
+
+/* Variáveis e objetos globais */
+Ultrasonic ultrasonic(GPIO_TRIGGER, GPIO_ECHO);
+unsigned long timestamp_medicao_distancia;
+unsigned long timestamp_envio_sigfox;
+unsigned long timestamp_breathing_light;
+bool led_aceso = false;
+char comando_at_envio_sigfox[100] = {0};
+float area_superficial_reservatorio = 0.0;
+float volume = 0.0;  //m³
+float vazao = 0.0;  //m³/s
+float dist_1 = 0.0;
+float dist_2 = 0.0;
+int contador_medicoes = 1;
+
+/* Protótipos */
+void hardware_reset_HT32SX(void);
+void envia_comando_AT_HT32SX(char * pt_comando);
+unsigned long diferenca_tempo(unsigned long tref);
+void aguarda_e_mostra_recepcao_HT32SX(void);
+void envia_mensagem_sigfox(void);
+float mede_distancia_em_metros(void);
+float media_distancias(void);
+
+/* Função: reseta (via hardware) o HT32SX 
+ * Parâmetros: nenhum
+ * Retorno: nenhum
+ */
+void hardware_reset_HT32SX(void) 
+{
+    digitalWrite(RESET, HIGH);
+    delay(1000);
+    digitalWrite(RESET, LOW);
+    delay(100);    
+}
+
+/* Função: envia comando AT para o HT32SX
+ * Parâmetros: ponteiro para string de comando
+ * Retorno: nenhum
+ */
+void envia_comando_AT_HT32SX(char * pt_comando)
+{
+    char cmd_buffer[50] = {0};
+    memcpy(cmd_buffer, pt_comando, strlen(pt_comando));
+    serial_HT32SX.write(cmd_buffer, strlen(cmd_buffer));
+    serial_HT32SX.flush();
+}
+
+/* Função: calcula a diferença entre instante atual e
+ *         uma referência de tempo
+ * Parâmetros: referência de tempo
+ * Retorno: diferença de tempo calculada
+ */
+unsigned long diferenca_tempo(unsigned long tref)
+{
+    return (millis() - tref);
+}
+
+/* Função: aguarda recepcao de dados do HT32SX 
+ *         pela UART
+ * Parâmetros: nenhum
+ * Retorno: nenhum
+ */
+void aguarda_e_mostra_recepcao_HT32SX(void)
+{
+    unsigned long timestamp_recepcao_serial;
+    char c;
+    
+    timestamp_recepcao_serial = millis();
+        
+    while(diferenca_tempo(timestamp_recepcao_serial) <= 3000)
+    {
+        if (serial_HT32SX.available()) 
+        {
+            c = serial_HT32SX.read(); 
+            Serial.print(c);
+        }
+    }  
+}
+
+/* Função: envia mensagem via SigFox
+ * Parâmetros: nenhum
+ * Retorno: nenhum
+ */
+void envia_mensagem_sigfox(void)
+{
+    /* Acorda HT32SX, faz a configuração da zona de comunicação 
+       e envia mensagem SigFox */
+    envia_comando_AT_HT32SX(CMD_AT_HT32SX_SAI_DEEP_SLEEP);
+    aguarda_e_mostra_recepcao_HT32SX();
+    hardware_reset_HT32SX();
+    aguarda_e_mostra_recepcao_HT32SX();
+    envia_comando_AT_HT32SX(CMD_AT_HT32SX_RCZ2);    
+    aguarda_e_mostra_recepcao_HT32SX();
+
+    /* Formata e envia comando AT */
+    memset(comando_at_envio_sigfox, 0x00, sizeof(comando_at_envio_sigfox));
+    sprintf(comando_at_envio_sigfox, "%s%08x%08x;", CMD_AT_HT32SX_MANDA_BYTES, 
+                                                    vazao,
+                                                    volume);
+
+    #ifdef ESCREVE_DEBUG_SENSORES
+    Serial.print("Comando AT: ");
+    Serial.println(comando_at_envio_sigfox);
+    #endif
+        
+    envia_comando_AT_HT32SX(comando_at_envio_sigfox);
+    aguarda_e_mostra_recepcao_HT32SX();
+        
+    /* HT32SX entra em modo sleep novamente */
+    envia_comando_AT_HT32SX(CMD_AT_HT32SX_ENTRA_DEEP_SLEEP);
+    aguarda_e_mostra_recepcao_HT32SX();
+}
+
+ /*
+  * Função: média de medidas de distância
+  * Parâmetros: nenhum
+  * Retorno: média das distâncias calculada
+  */
+float media_distancias(void)
+{
+    int i;
+    float soma_medidas;
+    float media;
+ 
+    soma_medidas = 0.0;
+    for(i=0; i<NUM_MEDIDAS_DISTANCIA; i++)
+        soma_medidas = soma_medidas + mede_distancia_em_metros();     
+ 
+    media = (soma_medidas / NUM_MEDIDAS_DISTANCIA);    
+    return media;    
+}
+ 
+ 
+ /*
+  * Função: mede distancia em metros
+  * Parametros: nenhum
+  * Retorno: distancia (m)
+ */
+float mede_distancia_em_metros(void) 
+{
+    float cm_sec, dist_metros;
+    long microsec = ultrasonic.timing();
+ 
+    cm_sec = ultrasonic.convert(microsec, Ultrasonic::CM);
+    
+    #ifdef ESCREVE_DEBUG_SENSOR
+        Serial.println("[DADOS DO SENSOR]");
+        Serial.print("Tempo(ms): ");
+        Serial.print(microsec);
+        Serial.print(", Distancia(cm): ");
+        Serial.print(cm_sec);
+    #endif
+    
+    dist_metros = (cm_sec / 100.0);
+    return dist_metros; 
+}
+
+void setup() 
+{    
+    /* Inicializa as comunicações seriais */
+    Serial.begin(BAUDRATE_SERIAL_DEBUG);
+    serial_HT32SX.begin(BAUDRATE_SERIAL_HT32SX);
+    Serial.println("SigFox - monitoramento remoto de reservatorio de agua");
+    Serial.println("Aguarde...");
+
+    /* Inicializa GPIOs */
+    pinMode(RESET, OUTPUT);
+    digitalWrite(RESET, HIGH);
+    pinMode(LED, OUTPUT);
+    digitalWrite(LED, LOW);
+
+    /* Calcula área supercifial do reservatório */
+    area_superficial_reservatorio = PI_APROXIMADO * RESERVATORIO_RAIO * RESERVATORIO_RAIO;
+
+    #ifdef ESCREVE_DEBUG_SENSOR
+    Serial.print("Area superficial do reservatorio: ");
+    Serial.println(area_superficial_reservatorio);
+    #endif
+
+    /* Reseta HT32SX via hardware, via software e configura zona para RCZ2*/
+    hardware_reset_HT32SX();
+    delay(8000);
+    envia_comando_AT_HT32SX(CMD_AT_HT32SX_ENTRA_DEEP_SLEEP);
+    
+    /* Inicializa temporização da medição de: 
+     * - Distância
+     * - Envio SigFox 
+     * - Breathing light
+    */
+    timestamp_medicao_distancia = millis();
+    timestamp_envio_sigfox = millis();
+    timestamp_breathing_light = millis();
+}
+
+void loop() 
+{
+    char c;
+    float delta_dist;
+    
+    /* Escreve mensagens recebidas da UART com o HT32SX */
+    if (serial_HT32SX.available()) 
+    {
+        c = serial_HT32SX.read(); 
+        Serial.print(c);
+    }
+
+    /* Pisca breathing light */
+    if (diferenca_tempo(timestamp_breathing_light) >= TEMPO_BREATHING_LIGHT)
+    {
+        if (led_aceso == false)
+        {
+            digitalWrite(LED, HIGH);
+            led_aceso = true;
+        }
+        else
+        {
+            digitalWrite(LED, LOW);
+            led_aceso = false;
+        }
+        
+        timestamp_breathing_light = millis();
+    }
+
+    /* Mede a distância e calcula volume e vazão */
+    if (diferenca_tempo(timestamp_medicao_distancia) >= 1000)
+    {
+        if (contador_medicoes == 1)
+        {
+            /* Obtem distância (já com filtro de média) */
+            dist_1 = media_distancias();
+
+            #ifdef ESCREVE_DEBUG_SENSOR
+            Serial.print("Distancia 1:");
+            Serial.print(dist_1);
+            Serial.println("m");
+            #endif
+            
+            contador_medicoes++;
+        }
+        else
+        {
+            /* Obtem distância (já com filtro de média) e calcula
+               vazão (m³/s) e volume (m³) */
+            dist_2 = media_distancias();
+
+            #ifdef ESCREVE_DEBUG_SENSOR
+            Serial.print("Distancia 2:");
+            Serial.print(dist_2);
+            Serial.println("m");
+            #endif
+            
+            delta_dist = dist_1 - dist_2;
+            vazao = area_superficial_reservatorio * delta_dist;
+            volume = (RESERVATORIO_ALTURA - delta_dist) * area_superficial_reservatorio;
+
+            #ifdef ESCREVE_DEBUG_SENSOR
+            Serial.println("Informacoes do reservatorio:");
+            Serial.print("* Vazao: ");
+            Serial.print(vazao);
+            Serial.println("m^3/s");
+            Serial.print("* Volume: ");
+            Serial.print(volume);
+            Serial.println("m^3");
+            #endif
+            
+            contador_medicoes = 1; 
+        }
+        
+
+        timestamp_medicao_distancia = millis();
+    }
+
+    /* Verifica se é o momento de enviar medições via SigFox */
+    if (diferenca_tempo(timestamp_envio_sigfox) >= TEMPO_ENTRE_ENVIOS_SIGFOX)
+    {
+        envia_mensagem_sigfox();
+        timestamp_envio_sigfox = millis();
+    }
+}
