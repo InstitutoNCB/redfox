@@ -1,0 +1,248 @@
+#define TX 2        // Serial TX 
+#define RX 3        // Serial RX
+#define RESET 4     // Reset no HT32SX
+#define SW1 5       // Botão na Placa EDUKIt
+#define pino_echo 8      //pino ligado no nano
+#define pino_trigger 9      //pino ligado no nano
+#define LED 13      // Led no Arduino Nano
+
+#include <SoftwareSerial.h>       // Biblioteca de Serial por Software
+SoftwareSerial serial_HT(RX, TX); // Cria Serial paca conectar no HT32SX
+
+long duracao=0;
+long distancia=0;
+long distanciacm=0; //cm variável ulitizada no ssrsvf1 (sensor ultrasonico)
+long rsvf1area=200000; //reserv. bloco F largura=400cm, comprimento=500cm (200.000cm2)
+long rsvf1altura=300; //reserv. bloco F altura=300cm
+long volumebblg=0; //reserv. bloco F volume m3 quando bomba liga
+long volumebbds=0; //reserv. bloco F volume m3 quando bomba desliga
+long volumedsds=0;
+long volume=0;
+long consumo=0;
+int volaux=0;
+int consaux=0;
+
+byte bbf1=0;
+byte bbf2=0;
+byte bbfx=0;
+
+char distanciacmstr[8]; 
+char volumebblgstr[14];
+char volumebbdsstr[14];
+char volumedsdsstr[14];
+char consumostr[14];
+
+char buf[48];            // Buffer usado para conversão de String.
+char bufdsds[60];
+char bufbblg[60];
+char bufbbds[80];
+
+void setup() { 
+
+digitalWrite(RESET, HIGH); // ativa Reset  
+pinMode(RESET, OUTPUT);   // configura o pino digital RESET como saida
+pinMode(pino_echo, INPUT);    
+pinMode(pino_trigger, OUTPUT); 
+
+Serial.begin(9600);        // Abre Serial de Hardware em 9600 bps
+                           // Conectada no Monitor Serial (PC)
+serial_HT.begin(9600);     // Abre Serial de Software em 9600 bps
+                           // Conectada no HT32SX
+                           
+//Escreve no Monitor Serial Menu de opções de comandos
+Serial.println("Consumo de Água do Bloco F");
+
+bbestado();
+sensorultrassom();
+delay(100);
+volume=(rsvf1altura-distanciacm)*rsvf1area;
+delay(100);
+Serial.println(distanciacm);
+Serial.println(volume);
+init_HT();
+
+} // Fim do setup()
+
+
+void loop() {            // Loop principal
+
+int  erro_HT;           //fim da delay_msg tem return(erro)
+
+Serial.println("Aguardando 1 minuto ..."); 
+delay (60000);          // Delay de 1 minuto (1000 = 1s)
+
+switch (bbfx) {
+  case 0: 
+    while(bbfx==0) {
+      Serial.println("Bombas Desligadas");
+      sensorbbdsds();
+      delay(10000);
+      bbestado();
+      }
+    break;
+
+  case 1: 
+    Serial.println("Bomba1 Ligada"); 
+    sensorbblg();
+    while(bbfx==1) {bbestado();}
+    Serial.println("Bomba1 Desligada"); 
+    sensorbbds();
+    break;
+ 
+  case 2: 
+    Serial.println("Bomba2 Ligada"); 
+    sensorbblg();
+    while(bbfx==2) {bbestado();}
+    Serial.println("Bomba2 Desligada"); 
+    sensorbbds();
+    break;
+
+  case 3: 
+    Serial.println("Alarme - Duas Bombas Ligadas - Aguardar Manutenção");
+    while(bbfx==3) {bbestado();}
+    break;
+}//fim do switch
+
+init_HT();
+
+}// fim do Loop()
+
+// ----------------------------------------------------------
+void evsigfox() {
+volaux=volume/1000000;
+consaux=consumo/1000000;
+Serial.println("Vai enviar Mensagem SIGFOX");
+sprintf(buf, "AT+SEND=0:%02x%04x%04x;", bbfx, volaux, consaux);     //monta Buffer 
+Serial.println (buf);   // Envia Buffer para o Terminal
+Serial.println();
+serial_HT.print (buf);  // Envia Buffer para Sigfox
+delay_msg();
+}
+// ----------------------------------------------------------
+
+//Função Lê sensor com bb desligadas
+void sensorbbdsds() {  
+  sensorultrassom();
+  volumedsds=(rsvf1altura-distanciacm)*rsvf1area;
+  if(volume > volumedsds) {consumo = volume - volumedsds;}
+  if(volume < volumedsds) {consumo = volumedsds - volume;}
+  volume = volumedsds;  
+  dtostrf(distanciacm, 7, 2, distanciacmstr);
+  dtostrf(volumedsds, 11, 2, volumedsdsstr); 
+  dtostrf(consumo, 11, 2, consumostr);
+  sprintf(bufdsds, "D(cm)=%s - V(cm3)=%s - Consumo(cm3)=%s", distanciacmstr, volumedsdsstr, consumostr); 
+  Serial.println (bufdsds); 
+  Serial.println (); 
+  evsigfox();
+  }
+
+// ----------------------------------------------------------
+
+//Função Lê sensor após bb ligar
+void sensorbblg() {  
+  sensorultrassom();
+  volumebblg=(rsvf1altura-distanciacm)*rsvf1area;   //volume em cm3
+  if(volume > volumebblg) {consumo = volume - volumebblg;}
+  if(volume < volumebblg) {consumo = volumebblg - volume;}
+  volume = volumebblg;  
+  dtostrf(distanciacm, 7, 2, distanciacmstr);
+  dtostrf(volumebblg, 11, 2, volumebblgstr);
+  dtostrf(consumo, 11, 2, consumostr);
+  sprintf(bufbblg, "BB LIG - D(cm)=%s - V(cm3)=%s - Consumo(cm3)=%s", distanciacmstr, volumebblgstr, consumostr);  
+  Serial.println (bufbblg); 
+  Serial.println (); 
+  evsigfox();
+} 
+
+// ----------------------------------------------------------
+
+//Função Lê sensor após bb desligar
+void sensorbbds() {  
+  sensorultrassom();
+  volumebbds=(rsvf1altura-distanciacm)*rsvf1area;   //volume em cm3
+  if(volume > volumebbds) {consumo = volume - volumebbds;}
+  if(volume < volumebbds) {consumo = volumebbds - volume;}
+  volume = volumebbds;  
+  dtostrf(distanciacm, 7, 2, distanciacmstr);
+  dtostrf(volumebbds, 11, 2, volumebbdsstr);
+  dtostrf(consumo, 11, 2, consumostr);
+  sprintf(bufbbds, "BB DESLIG - D(cm)=%s - V(cm3)=%s - Consumo(cm3)=%s", distanciacmstr, volumebbdsstr, consumostr);  
+  Serial.println (bufbbds); 
+  Serial.println (); 
+  evsigfox();
+}
+
+// ----------------------------------------------------------
+//Função verifica estado das bombas
+void bbestado() {
+  delay(1000);
+  bbf1=digitalRead(6);
+  bbf2=digitalRead(7);
+ 
+  if(bbf2==0 && bbf1==0) {bbfx=0;} // bombas desligadas
+  if(bbf2==0 && bbf1==1) {bbfx=1;} // bomba 1 ligada
+  if(bbf2==1 && bbf1==0) {bbfx=2;} // bomba 2 ligada
+  if(bbf2==1 && bbf1==1) {bbfx=3;} // alarme-duas bombas ligadas
+ }
+// ----------------------------------------------------------
+
+void sensorultrassom() {  
+ digitalWrite (pino_trigger, LOW);
+  delay(1000);
+  digitalWrite (pino_trigger, HIGH) ;
+  delayMicroseconds(10);
+  digitalWrite (pino_trigger, LOW);
+  duracao = pulseIn(pino_echo, HIGH); //largura do pulso em us
+  distanciacm= duracao/58;
+}
+// ----------------------------------------------------------
+
+//Função de RESET do HT32SX por Hardware
+void reset_HT() {          
+  digitalWrite(RESET, HIGH);       // ativa Reset
+  delay(1000);                     // espera por um segundo
+  digitalWrite(RESET, LOW);        // libera Reset
+  delay(2000);                     // espera 100 milisegundos  
+  Serial.println("RESET HT32SX");     
+}                                  // fim da função reset_HT
+
+// ----------------------------------------------------------
+
+// Função Inicializa HT
+void init_HT()
+ {
+   reset_HT();  // Gera Reset de Hardware
+   //delay_msg();
+   serial_HT.print("AT+CFGRCZ=2;");   // Inicializa lib para RC2
+   //Serial.println("RC2");
+   delay_msg();
+ }
+
+// ----------------------------------------------------------
+
+int delay_msg() // Fica esperando Mensagens finaliza em 45 Segundos.
+     { 
+      int  erro = 1; 
+      Serial.println("Aguarde 10 segundos ...");
+      uint16_t i;
+       
+       for ( i =0; i<10000; i++)  // time out 10 segundos
+        {
+         if (serial_HT.available()) 
+         {
+          String resposta = serial_HT.readString(); 
+          Serial.print(resposta);
+          if(resposta.indexOf("Error Send Frame: 0") > 0) { 
+             erro = 0;    
+          }
+          if(resposta.indexOf("AT_cmd_Waiting...") > 0) {   
+            i = 50000; // Modulo finalizou operação pode receber novo comando.
+          }
+         } // serial HT
+         delay(1);
+       } // fim do for 10000
+       digitalWrite(LED, LOW);     // Apaga o Led, 
+       Serial.println("Pronto para receber novo comando.");
+       Serial.println();
+       return(erro);       
+     }// fim função delay_msg
