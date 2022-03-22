@@ -1,0 +1,290 @@
+/*-------------------------------------------------------------------------*
+ * Firmware:  Deflorest Sensor Rev. 1.2                                    *
+ * Autor:     Vitor Vitalino                                               *
+ * Data:      28/12/2021                                                   *
+ * Este programa utiliza o Edukit Redfox para realizar a leitura           *
+ * dos dados de um acelerômetro MPU6050 e enviar para os servidores Sigfox *
+ *-------------------------------------------------------------------------*/
+
+//Inclui Bibliotecas Necessárias para o funcionamento 
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <SoftwareSerial.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include<Wire.h>
+
+//Endereço I2C do sensor acelerômetro MPU6050
+#define MPU6050_ADDR 0x68
+
+//Definição de pinos referente ao Edukit Redfox 
+#define RESET 4  //Reset no HT32SX
+#define TX  2    //Serial TX
+#define RX  3    //Serial RX
+#define LED 13   //LED do arduino Nano
+#define SW1 5    //Boão da placa edukit
+
+//Criação de itens para comunicação e para o sensor
+SoftwareSerial serial_HT(RX,TX);
+Adafruit_MPU6050 mpu;
+
+//Criação de variáveis
+char buffer[60];
+
+//Estrutura contendo variáveis que armazenaram os dados  
+typedef struct{
+  int16_t AccX,AccY,AccZ;
+  int16_t GyroX,GyroY,GyroZ;
+  int16_t Temp;
+} MPU6050_Data;
+
+//Declaração de estrutura do tipo de dados acima
+MPU6050_Data ReadMPUData;
+
+/*---------------------------------------------------------*
+ * Função: setup()                                         *
+ * Esta função inicializa todas as configurações referente *
+ * a pinos e comunicação relacionados ao arduino           * 
+ *---------------------------------------------------------*/
+void setup() {
+    //Configuração do pino de reset
+    digitalWrite(RESET, HIGH);
+    pinMode(RESET, OUTPUT);
+    //Configuração dos pinos para o botão e o led
+    pinMode(SW1, INPUT_PULLUP);
+    pinMode(LED, OUTPUT);
+
+    //Inicialização da serial primária (Usuário - Arduino)
+    Serial.begin(115200); // Sensor precisa ser 115200
+    while (!Serial)  delay(10);
+
+    //Inicialização da serial secundária (Arduino - HT32)
+    serial_HT.begin(9600);  //Abre serial do software conectada ao HT32SX
+    reset_HT();     //Reseta o hardware HT
+    delay(8000);
+
+    serial_HT.print("AT+CFGRCZ=2;"); //Configura HT para região RC2
+    delay(2000);
+    
+    //Inicializa a comunicação com o acelerômetro
+    do{
+      if (!mpu.begin()){
+        Serial.println("Failed to find MPU6050 chip");
+        delay(100);
+      }
+      else Serial.println("MPU6050 Found!");
+    }while(!mpu.begin());
+
+    //Configurações basicas doacelerômetro
+    mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    //mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+    Serial.println("");
+    delay(100);
+    
+} //Fim do setup
+
+ /*--------------------------------------------------------*
+ * Função: loop()                                          *
+ * Esta função contem a rotina principal de leitura e      *
+ * ações que serão executadas periódicamente               * 
+ *---------------------------------------------------------*/
+void loop(){
+
+    while (true)
+    {
+        MPU6050_ReadRawData(&ReadMPUData);
+    
+        sprintf(buffer, "AccX= %04X | AccY= %04X | AccZ= %04X | Temp= %04X", ReadMPUData.AccX, ReadMPUData.AccY, ReadMPUData.AccZ, ReadMPUData.Temp);
+        Serial.println(buffer);    
+        delay(100);
+        
+        Serial.println("Enviando MSG - SIGFOX");
+        sprintf(buffer,"AT+SEND=0:%04x%04x%04x;", ReadMPUData.AccX, ReadMPUData.AccY, ReadMPUData.AccZ);
+        
+        Serial.println(buffer);
+        serial_HT.print(buffer);
+        delay_msg();
+        delay(7200000); //Delay de 2 horas 
+    }
+}
+
+ /*--------------------------------------------------------*
+ * Função: reset_HT()                                      *
+ * Esta função reseta o CI HX                              * 
+ *---------------------------------------------------------*/
+void reset_HT(){
+    digitalWrite(RESET,HIGH);
+    delay(1000);
+    digitalWrite(RESET,LOW);
+    delay(100);
+} //Fim da função reset_HT
+
+ /*--------------------------------------------------------*
+ * Função: Char2Int()                                      *
+ * Esta função converte dados de char para o formato int   * 
+ *---------------------------------------------------------*/
+int Char2Int(char c){
+    int x;
+    if(c >= '0' && c <='9')         x = c - '0';
+    else if(c >= 'a' && c <= 'f')   x = (c - 'a') + 10;
+    else                            return(-1);
+
+    return(x);
+}//Fim da função Char2Int
+
+
+ /*--------------------------------------------------------*
+ * Função: delay_msg()                                     *
+ * Esta função separa e envia a informação do sensor para  *
+ * o HX enviar através da rede Sigfox                      * 
+ *---------------------------------------------------------*/
+void delay_msg(){
+  int Temp_H, Temp_L; 
+  int AccX_H, AccX_L;
+  int AccY_H, AccY_L;
+  int AccZ_H, AccZ_L;
+  int x, xPos;
+  uint16_t i;
+  char c;
+  char buf_aux[80];
+  
+  digitalWrite(LED, HIGH);
+  Serial.println("Aguarde 45s ou até o led apagar");
+    
+  for(i = 0; i<45000; i++)
+  {
+    if(serial_HT.available()) //Verifica se existe algum dado do HT
+    {
+      String resposta = serial_HT.readString(); //Recebe o Dado do HT
+      Serial.print(resposta); //Exibe o dado recebido do HT
+      
+      if(resposta.indexOf("Customer resp:")> 0) // Verifica se dentro da string resposta, após a frase, se existe alguma informação
+      {
+
+
+        
+        //--------AQUISIÇÃO AccX_H-------------------------------------
+        xPos = resposta.indexOf('x'); //Procura o primeiro 'x' dentro da frase e retorna um int com a pos começando em zero 
+        c = resposta[xPos+1]; // char C recebe o primeiro valor após o 'x'
+        AccX_H = Char2Int(c); // int Cont converte o primeiro valor recebido após o 'x'
+        c = resposta[xPos+2]; // char C recebe o segundo valor após o 'x'
+        
+        if(c != ',')// Compara o valor c, se não é a virgula que separa os dados
+        {
+          x = Char2Int(c);
+          AccX_H *= 16;
+          AccX_H += x;  
+        }
+        //--------AQUISIÇÃO AccX_L-------------------------------------
+        xPos = resposta.indexOf('x', xPos+1);
+        c = resposta[xPos+1];
+        AccX_L = Char2Int(c);
+        c = resposta[xPos+2];
+        
+        if(c != ',')
+        {
+          x = Char2Int(c);
+          AccX_L *= 16;
+          AccX_L += x;  
+        }
+        
+        //--------AQUISIÇÃO AccY_H-------------------------------------
+        xPos = resposta.indexOf('x', xPos+1); //Procura o primeiro 'x' dentro da frase e retorna um int com a pos começando em zero 
+        c = resposta[xPos+1]; // char C recebe o primeiro valor após o 'x'
+        AccY_H = Char2Int(c); // int Cont converte o primeiro valor recebido após o 'x'
+        c = resposta[xPos+2]; // char C recebe o segundo valor após o 'x'
+        
+        if(c != ',')// Compara o valor c, se não é a virgula que separa os dados
+        {
+          x = Char2Int(c);
+          AccY_H *= 16;
+          AccY_H += x;  
+        }
+        //--------AQUISIÇÃO AccY_L-------------------------------------
+        xPos = resposta.indexOf('x', xPos+1);
+        c = resposta[xPos+1];
+        AccY_L = Char2Int(c);
+        c = resposta[xPos+2];
+        
+        if(c != ',')
+        {
+          x = Char2Int(c);
+          AccY_L *= 16;
+          AccY_L += x;  
+        }
+        
+        //--------AQUISIÇÃO AccZ_H-------------------------------------
+        xPos = resposta.indexOf('x'); //Procura o primeiro 'x' dentro da frase e retorna um int com a pos começando em zero 
+        c = resposta[xPos+1]; // char C recebe o primeiro valor após o 'x'
+        AccZ_H = Char2Int(c); // int Cont converte o primeiro valor recebido após o 'x'
+        c = resposta[xPos+2]; // char C recebe o segundo valor após o 'x'
+        
+        if(c != ',')// Compara o valor c, se não é a virgula que separa os dados
+        {
+          x = Char2Int(c);
+          AccZ_H *= 16;
+          AccZ_H += x;  
+        }
+        //--------AQUISIÇÃO AccZ_L-------------------------------------
+        xPos = resposta.indexOf('x', xPos+1);
+        c = resposta[xPos+1];
+        AccZ_L = Char2Int(c);
+        c = resposta[xPos+2];
+        
+        if(c != ',')
+        {
+          x = Char2Int(c);
+          AccZ_L *= 16;
+          AccZ_L += x;  
+        }
+     
+        ReadMPUData.AccX = AccX_H;
+        ReadMPUData.AccX = ReadMPUData.AccX * 256;
+        ReadMPUData.AccX = ReadMPUData.AccX + AccX_L;
+
+        ReadMPUData.AccY = AccY_H;
+        ReadMPUData.AccY = ReadMPUData.AccY * 256;
+        ReadMPUData.AccY = ReadMPUData.AccY + AccY_L;
+
+        ReadMPUData.AccZ = AccZ_H;
+        ReadMPUData.AccZ = ReadMPUData.AccZ * 256;
+        ReadMPUData.AccZ = ReadMPUData.AccZ + AccZ_L;
+
+        sprintf(buf_aux, "Valor Recebido: AccX= 0x%4x, AccY= 0x%4x, AccZ= 0x%04x", ReadMPUData.AccX, ReadMPUData.AccY, ReadMPUData.AccZ);
+        Serial.println(buf_aux);
+      }
+      if(resposta.indexOf("AT_cmd_Waiting...")> 0 )   i = 50000;   
+      Serial.println(" ");
+    }
+    delay(1);
+  }
+  digitalWrite(LED, LOW);
+  Serial.println("Pronto para receber novo comando");
+  Serial.println(" ");
+}//Fim da função delay_msg()
+
+
+ /*--------------------------------------------------------*
+ * Função: MPU6050_ReadRawData()                           *
+ * Esta função realiza a leitura de dados provenientes do  *
+ * sensor MPU 6050 e estão sem nenhum tipo de tratamento   *
+ * no formato complemento de dois de 16 bits               *
+ *---------------------------------------------------------*/
+
+void MPU6050_ReadRawData(MPU6050_Data* ReadMPUDatas){
+  
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x3B);
+    Wire.endTransmission(false);
+    
+    Wire.requestFrom(MPU6050_ADDR,14,true);
+    ReadMPUDatas->AccX  = Wire.read() <<8 | Wire.read();
+    ReadMPUDatas->AccY  = Wire.read() <<8 | Wire.read();
+    ReadMPUDatas->AccZ  = Wire.read() <<8 | Wire.read();
+    ReadMPUDatas->Temp  = Wire.read() <<8 | Wire.read();
+    ReadMPUDatas->GyroX = Wire.read() <<8 | Wire.read();
+    ReadMPUDatas->GyroY = Wire.read() <<8 | Wire.read();
+    ReadMPUDatas->GyroZ = Wire.read() <<8 | Wire.read();
+}
